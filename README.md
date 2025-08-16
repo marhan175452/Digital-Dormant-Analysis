@@ -1,4 +1,4 @@
-# Digital Dormancy Analysis — Python + Oracle SQL (Sanitized)
+# Digital Dormancy Analysis — Python + Oracle SQL 
 
 This repository showcases an analytics workflow that measures **digital dormancy and engagement** for a retail-banking–style environment. It produces a normalized **metrics fact** table and a companion CSV that can be dropped into BI dashboards.
 
