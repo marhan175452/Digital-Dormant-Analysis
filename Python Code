@@ -1,0 +1,555 @@
+# === DIGITAL DORMANCY ANALYSIS  ===
+
+print("Digital_Dormancy_Analysis started")
+
+import sys
+import shutil
+import os
+import pandas as pd
+import numpy as np
+
+# --- Lightweight path hygiene  ---
+try:
+    shutil.rmtree(r'X:\Python\lib\__pycache__')
+except:
+    pass
+finally:
+    sys.path.append(r'X:\Python\lib')
+
+user = os.getlogin()
+try:
+    shutil.rmtree(f'C:\\Users\\{user}\\lib\\__pycache__')
+except:
+    pass
+finally:
+    sys.path.append(f'C:\\Users\\{user}\\lib')
+
+# --- DB connector (module/name) ---
+import db_conn  # was `connection`
+# db_conn.connect_to_warehouse() should return a connection with .execute(), .commit()
+
+# --- Date window snippets used inside SQL (Oracle style) ---
+START_OF_MONTH = "ADD_MONTHS(TRUNC(SYSDATE, 'MONTH'),-1)"
+END_OF_MONTH   = "TRUNC(SYSDATE, 'MONTH')-1"
+NINETY_DAYS_AGO_MONTH_ANCHORED = "TRUNC(SYSDATE, 'MONTH')-91"
+
+# =========================================================
+# Build base: customers with an open card + derived offer
+# =========================================================
+con = db_conn.connect_to_warehouse()
+
+try:
+    con.execute("drop table CUST_OPEN_CARD purge")
+except:
+    pass
+
+sql = """
+create table CUST_OPEN_CARD as
+select /*+ parallel(a) parallel(b) use_hash(a b) */
+       distinct a.CUSTOMER_ID           as CUSTOMER_ID,         -- was CLIENTID
+       a.CARD_ACCT_ID                   as CARD_ACCT_ID,        -- was CC_ACCOUNT_NUMBER
+       case
+         when substr(b.APP_CAMPAIGN_TYPE,1,1) = '1' then 'OFFER_A'   -- was SH_PLUS
+         when substr(b.APP_CAMPAIGN_TYPE,1,1) = '2' then 'OFFER_B'   -- was TR_PLUS
+         when substr(b.APP_CAMPAIGN_TYPE,1,1) = '3' then 'OFFER_C'   -- was RE_PLUS
+         when substr(b.APP_CAMPAIGN_TYPE,1,1) = 'M' and substr(b.APP_CAMPAIGN_TYPE,4,1) = '1' then 'OFFER_A'
+         when substr(b.APP_CAMPAIGN_TYPE,1,1) = 'M' and substr(b.APP_CAMPAIGN_TYPE,4,1) = '2' then 'OFFER_B'
+         when substr(b.APP_CAMPAIGN_TYPE,1,1) = 'M' and substr(b.APP_CAMPAIGN_TYPE,4,1) = '3' then 'OFFER_C'
+         else 'OTHER'
+       end                               as OFFER,
+       a.CARD_STATUS                    as CARD_STATUS,         -- was CC_STATUS
+       a.E_STATEMENT_FLAG               as E_STATEMENT_FLAG,    -- was CC_STMT_FLAG
+       a.CARD_OPEN_DATE                 as CARD_OPEN_DATE       -- was CC_DATE_OPENED
+from WAREHOUSE.DM_CARD a                                    -- was MINERVADMMART.DM_CREDIT_CARD
+left join WAREHOUSE.DM_APPLICATION b                        -- was MINERVADMMART.DM_APPLICATION
+  on substr(a.CARD_ACCT_ID, 7, 10) = b.APP_DISPLAY_ACCT_ID  -- was CA_DISPLAY_ACCOUNT_NUMBER
+where a.CARD_STATUS not in ('8','9','Z')
+  and a.CARD_CLOSE_DATE is null;
+"""
+con.execute(sql)
+con.close()
+
+# =========================================================
+# RESULTS sink (table name)
+# =========================================================
+con = db_conn.connect_to_warehouse()
+try:
+    con.execute("drop table METRIC_RESULTS purge")
+except:
+    pass
+
+con.execute("""
+create table METRIC_RESULTS(
+  CATEGORY        varchar2(40),
+  OFFER           varchar2(16),
+  METRIC          varchar2(200),
+  FIGURES         number
+)
+""")
+con.close()
+
+# =========================================================
+# In-memory base join with “digital ladder” (file/path)
+# =========================================================
+con = db_conn.connect_to_warehouse()
+base_df = pd.read_sql("select * from CUST_OPEN_CARD", con)
+con.close()
+
+# Coerce types 
+base_df["CARD_ACCT_ID"] = base_df["CARD_ACCT_ID"].drop_duplicates()
+base_df["CUSTOMER_ID"] = base_df["CUSTOMER_ID"].astype(int).astype(str)
+
+# Import ladder file (replace with your demo path)
+digital_ladder = pd.read_csv(r'.\data\digital_ladder_sample.csv')  # was network share
+digital_ladder["CUSTOMER_ID"] = digital_ladder["CUSTOMER_ID"].astype(int).astype(str)
+
+# Merge: customer + ladder
+base_table = pd.merge(base_df, digital_ladder, on="CUSTOMER_ID")
+base_table["CUST_REF"] = base_table["CUST_REF"].astype(str)  # was CIN
+
+# =========================
+# Segment: FRICTION (was Digitally Frustrated)
+# =========================
+seg_friction = base_table[base_table["SEGMENT"] == "Friction"]  # was 'Digitally Frustrated'
+
+# Totals by offer
+offers, totals = np.unique(seg_friction["OFFER"], return_counts=True)
+
+con = db_conn.connect_to_warehouse()
+for off, tot in zip(offers, totals):
+    con.execute(f"""
+    insert into METRIC_RESULTS(CATEGORY, OFFER, METRIC, FIGURES)
+    select 'Friction', '{off}', 'Total customers', {int(tot)} from dual
+    """)
+    con.commit()
+con.close()
+
+# ===========================================
+# Last digital action tables (WEB + APP) — schema/field names
+# ===========================================
+# Last WEB (PIB) login snapshot
+con = db_conn.connect_to_warehouse()
+try:
+    con.execute("drop table LAST_WEB_LOGIN purge")
+except:
+    pass
+con.execute(f"""
+create table LAST_WEB_LOGIN as
+select w.CUSTOMER_ID,
+       w.WEB_LAST_LOGON_TIME  as LAST_WEB_TS
+from WAREHOUSE.DM_WEB_LOGON w                -- was DM_PIB_LOGON
+join CUST_OPEN_CARD c on w.CUSTOMER_ID = c.CUSTOMER_ID
+where w.WEB_LAST_LOGON_DATE <= {END_OF_MONTH}
+""")
+con.close()
+
+# Last APP (MIB) login snapshot
+con = db_conn.connect_to_warehouse()
+try:
+    con.execute("drop table LAST_APP_LOGIN purge")
+except:
+    pass
+con.execute(f"""
+create table LAST_APP_LOGIN as
+select m.CUSTOMER_ID,
+       m.APP_LAST_LOGON_TIME as LAST_APP_TS
+from WAREHOUSE.DM_APP_LOGON m                -- was DM_MIB_LOGON
+join CUST_OPEN_CARD c on m.CUSTOMER_ID = c.CUSTOMER_ID
+where m.APP_LAST_LOGON_DATE <= {END_OF_MONTH}
+""")
+con.close()
+
+# Consolidated last digital login
+con = db_conn.connect_to_warehouse()
+try:
+    con.execute("drop table LAST_DIGITAL_LOGIN purge")
+except:
+    pass
+con.execute("""
+create table LAST_DIGITAL_LOGIN as
+with unified as (
+  select CUSTOMER_ID, LAST_WEB_TS as LAST_DIGITAL_TS from LAST_WEB_LOGIN
+  union
+  select CUSTOMER_ID, LAST_APP_TS as LAST_DIGITAL_TS from LAST_APP_LOGIN
+),
+latest as (
+  select CUSTOMER_ID, max(LAST_DIGITAL_TS) as LAST_DIGITAL_TS
+  from unified
+  group by CUSTOMER_ID
+)
+select l.CUSTOMER_ID,
+       l.LAST_DIGITAL_TS,
+       case
+         when l.LAST_DIGITAL_TS = w.LAST_WEB_TS then 'WEB'
+         when l.LAST_DIGITAL_TS = a.LAST_APP_TS then 'APP'
+       end as PLATFORM
+from latest l
+left join LAST_WEB_LOGIN w on l.CUSTOMER_ID = w.CUSTOMER_ID
+left join LAST_APP_LOGIN a on l.CUSTOMER_ID = a.CUSTOMER_ID
+""")
+con.close()
+
+# Last APP event id at last action
+con = db_conn.connect_to_warehouse()
+try:
+    con.execute("drop table LAST_APP_ACTION purge")
+except:
+    pass
+con.execute("""
+create table LAST_APP_ACTION as
+select distinct d.CUSTOMER_ID, s.APP_EVENT_ID
+from LAST_DIGITAL_LOGIN d
+join WAREHOUSE.DM_MOBILE_EVENTS s         -- was DM_MOBILE_BANK_SERVICING
+  on d.CUSTOMER_ID = s.CUSTOMER_ID
+where d.LAST_DIGITAL_TS = s.APP_EVENT_TS  -- was EVENT_TIME
+  and d.PLATFORM = 'APP'
+""")
+con.close()
+
+# Last WEB action id at last action (date+time join)
+con = db_conn.connect_to_warehouse()
+try:
+    con.execute("drop table LAST_WEB_DATE_TIME purge")
+except:
+    pass
+con.execute(f"""
+create table LAST_WEB_DATE_TIME as
+select x.CUSTOMER_ID,
+       y.LAST_ACTION_DATE,
+       max(w.WEB_ACTION_TIME) as LAST_ACTION_TIME
+from WAREHOUSE.DM_WEB_EVENTS w            -- was DM_ECOMMERCE_MIA
+join LAST_DIGITAL_LOGIN x on w.CUSTOMER_ID = x.CUSTOMER_ID
+join (
+  select CUSTOMER_ID, max(WEB_ACTION_DATE) as LAST_ACTION_DATE
+  from WAREHOUSE.DM_WEB_EVENTS
+  where WEB_ACTION_DATE <= {END_OF_MONTH}
+  group by CUSTOMER_ID
+) y on w.CUSTOMER_ID = y.CUSTOMER_ID
+where w.WEB_ACTION_DATE = y.LAST_ACTION_DATE
+  and w.WEB_ACTION_DATE <= {END_OF_MONTH}
+  and x.PLATFORM = 'WEB'
+group by x.CUSTOMER_ID, y.LAST_ACTION_DATE
+""")
+
+try:
+    con.execute("drop table LAST_WEB_ACTION purge")
+except:
+    pass
+con.execute("""
+create table LAST_WEB_ACTION as
+select d.CUSTOMER_ID, e.WEB_ACTION
+from LAST_WEB_DATE_TIME d
+join WAREHOUSE.DM_WEB_EVENTS e
+  on d.CUSTOMER_ID = e.CUSTOMER_ID
+ and d.LAST_ACTION_TIME = e.WEB_ACTION_TIME
+ and d.LAST_ACTION_DATE = e.WEB_ACTION_DATE
+""")
+con.close()
+
+# Unified last action lookup (for WEB/APP)
+con = db_conn.connect_to_warehouse()
+last_actions = pd.read_sql("""
+select CUSTOMER_ID, APP_EVENT_ID as LAST_ACTION from LAST_APP_ACTION
+union
+select CUSTOMER_ID, WEB_ACTION   as LAST_ACTION from LAST_WEB_ACTION
+""", con)
+con.close()
+
+last_actions["CUSTOMER_ID"] = last_actions["CUSTOMER_ID"].astype(int).astype(str)
+
+# Join last actions into Friction segment and write top actions by offer
+friction_actions = pd.merge(seg_friction, last_actions, on="CUSTOMER_ID")
+
+# Helper to write action tallies per offer
+def write_offer_action_counts(df, offer_code):
+    counts = (
+        df[df["OFFER"] == offer_code]
+        .groupby("LAST_ACTION")
+        .size()
+        .sort_values(ascending=False)
+    )
+    con_loc = db_conn.connect_to_warehouse()
+    for act, cnt in counts.items():
+        con_loc.execute(f"""
+        insert into METRIC_RESULTS(CATEGORY, OFFER, METRIC, FIGURES)
+        select 'Friction', '{offer_code}', '{act}', {int(cnt)} from dual
+        """)
+        con_loc.commit()
+    con_loc.close()
+
+for code in ["OFFER_A", "OFFER_B", "OFFER_C", "OTHER"]:
+    write_offer_action_counts(friction_actions, code)
+
+# =========================================================
+# Contact-centre (CSR) calls in last 90 days 
+# =========================================================
+csr_calls = pd.read_excel(r'.\data\csr_calls_sample.xlsx')  # was CCC_Data_Final.xlsm
+csr_calls = csr_calls.rename(columns={r'External_Ref': 'CUST_REF'})  # was 'PBN / Account / Customer Number' -> 'CIN'
+csr_calls = csr_calls.filter(['CUST_REF', 'CALL_DATE'], axis=1)
+csr_calls = csr_calls[csr_calls.CUST_REF > 0.0].drop_duplicates(subset='CUST_REF')
+csr_calls["CUST_REF"] = csr_calls["CUST_REF"].astype(int).astype(str)
+
+friction_calls = pd.merge(seg_friction, csr_calls, on="CUST_REF")
+offers, totals = np.unique(friction_calls["OFFER"], return_counts=True)
+
+con = db_conn.connect_to_warehouse()
+for off, tot in zip(offers, totals):
+    con.execute(f"""
+    insert into METRIC_RESULTS(CATEGORY, OFFER, METRIC, FIGURES)
+    select 'Friction', '{off}', 'Customers calling contact centre (90d)', {int(tot)} from dual
+    """)
+    con.commit()
+con.close()
+
+# =========================================================
+# 90-day spend-active (card txn fact)
+# =========================================================
+con = db_conn.connect_to_warehouse()
+try:
+    con.execute("drop table SPEND_ACTIVE_90D purge")
+except:
+    pass
+con.execute(f"""
+create table SPEND_ACTIVE_90D as
+select distinct c.CUSTOMER_ID
+from CUST_OPEN_CARD c
+join WAREHOUSE.DM_CARD_TXN t              -- was DM_CREDIT_CARD_TRANSACTION
+  on c.CARD_ACCT_ID = t.CARD_ACCT_ID
+where upper(t.TXN_GROUP) like '%SPEND%'   -- was CC_TRANSACTION_GROUPING
+  and t.TXN_LOAD_DATE >= {NINETY_DAYS_AGO_MONTH_ANCHORED}  -- was CC_LOAD_DATE
+  and t.TXN_LOAD_DATE <= {END_OF_MONTH}
+""")
+con.close()
+
+con = db_conn.connect_to_warehouse()
+spend_active = pd.read_sql("select * from SPEND_ACTIVE_90D", con)
+con.close()
+spend_active["CUSTOMER_ID"] = spend_active["CUSTOMER_ID"].astype(int).astype(str)
+
+friction_spend = pd.merge(seg_friction, spend_active, on="CUSTOMER_ID")
+offers, totals = np.unique(friction_spend["OFFER"], return_counts=True)
+
+con = db_conn.connect_to_warehouse()
+for off, tot in zip(offers, totals):
+    con.execute(f"""
+    insert into METRIC_RESULTS(CATEGORY, OFFER, METRIC, FIGURES)
+    select 'Friction', '{off}', 'Spend-active customers (90d)', {int(tot)} from dual
+    """)
+    con.commit()
+con.close()
+
+# =========================================================
+# Customers paying down only BT balance last statement (cycle table)
+# =========================================================
+con = db_conn.connect_to_warehouse()
+try:
+    con.execute("drop table CARD_BT_ONLY_INT purge")
+except:
+    pass
+con.execute(f"""
+create table CARD_BT_ONLY_INT as
+select cy.*
+from CUST_OPEN_CARD c
+join WAREHOUSE.DM_CARD_CYCLE cy          -- was DM_CREDIT_CARD_CYCLE_HISTORY
+  on c.CUSTOMER_ID = cy.CUSTOMER_ID
+where cy.STMT_DATE >= {START_OF_MONTH}   -- was CC_STATEMENT_DATE
+  and cy.STMT_DATE <= {END_OF_MONTH}
+""")
+
+try:
+    con.execute("drop table CARD_BT_ONLY purge")
+except:
+    pass
+con.execute("""
+create table CARD_BT_ONLY as
+select distinct CUSTOMER_ID
+from CARD_BT_ONLY_INT
+where STMT_BT_BAL > 0                                 -- was CC_BT_STATEMENTED_BALANCE
+  and STMT_TOTAL_BAL = STMT_BT_BAL                    -- was CC_TOTAL_STATEMENTED_BALANCE
+""")
+con.close()
+
+con = db_conn.connect_to_warehouse()
+bt_only = pd.read_sql("select * from CARD_BT_ONLY", con)
+con.close()
+bt_only["CUSTOMER_ID"] = bt_only["CUSTOMER_ID"].astype(int).astype(str)
+
+friction_bt = pd.merge(seg_friction, bt_only, on="CUSTOMER_ID")
+offers, totals = np.unique(friction_bt["OFFER"], return_counts=True)
+
+con = db_conn.connect_to_warehouse()
+for off, tot in zip(offers, totals):
+    con.execute(f"""
+    insert into METRIC_RESULTS(CATEGORY, OFFER, METRIC, FIGURES)
+    select 'Friction', '{off}', 'Only BT balance on last statement', {int(tot)} from dual
+    """)
+    con.commit()
+con.close()
+
+# =========================================================
+# Dormancy period buckets ()
+# =========================================================
+con = db_conn.connect_to_warehouse()
+try:
+    con.execute("drop table LAST_DIGITAL_PERIOD purge")
+except:
+    pass
+con.execute(f"""
+create table LAST_DIGITAL_PERIOD as
+select z.CUSTOMER_ID,
+       case
+         when max(z.LAST_ACTION_DATE) between TRUNC(SYSDATE, 'MONTH')-121 and TRUNC(SYSDATE, 'MONTH')-91  then '90-120 days'
+         when max(z.LAST_ACTION_DATE) between TRUNC(SYSDATE, 'MONTH')-181 and TRUNC(SYSDATE, 'MONTH')-122 then '121-180 days'
+         when max(z.LAST_ACTION_DATE) <= TRUNC(SYSDATE, 'MONTH')-182                                         then '180+ days'
+       end as DORMANCY_BUCKET
+from (
+  select w.CUSTOMER_ID, w.WEB_LAST_LOGON_DATE as LAST_ACTION_DATE
+  from WAREHOUSE.DM_WEB_LOGON w
+  join CUST_OPEN_CARD c on w.CUSTOMER_ID = c.CUSTOMER_ID
+  where w.WEB_LAST_LOGON_DATE <= {NINETY_DAYS_AGO_MONTH_ANCHORED}
+  union
+  select m.CUSTOMER_ID, m.APP_LAST_LOGON_DATE
+  from WAREHOUSE.DM_APP_LOGON m
+  join CUST_OPEN_CARD c on m.CUSTOMER_ID = c.CUSTOMER_ID
+  where m.APP_LAST_LOGON_DATE <= {NINETY_DAYS_AGO_MONTH_ANCHORED}
+) z
+group by z.CUSTOMER_ID
+""")
+con.close()
+
+con = db_conn.connect_to_warehouse()
+dormancy = pd.read_sql("select * from LAST_DIGITAL_PERIOD", con)
+con.close()
+dormancy["CUSTOMER_ID"] = dormancy["CUSTOMER_ID"].astype(int).astype(str)
+
+friction_dorm = pd.merge(seg_friction, dormancy, on="CUSTOMER_ID")
+bucket_counts = friction_dorm.groupby(["OFFER", "DORMANCY_BUCKET"]).size()
+
+con = db_conn.connect_to_warehouse()
+for (off, bucket), cnt in bucket_counts.items():
+    con.execute(f"""
+    insert into METRIC_RESULTS(CATEGORY, OFFER, METRIC, FIGURES)
+    select 'Friction', '{off}', 'Dormancy: {bucket}', {int(cnt)} from dual
+    """)
+    con.commit()
+con.close()
+
+# =========================
+# Segment: ONBOARDING (was Digital Beginnings)
+# =========================
+seg_onboarding = base_table[base_table["SEGMENT"].str.strip() == "Onboarding"]
+
+# Totals by offer
+offers, totals = np.unique(seg_onboarding["OFFER"], return_counts=True)
+con = db_conn.connect_to_warehouse()
+for off, tot in zip(offers, totals):
+    con.execute(f"""
+    insert into METRIC_RESULTS(CATEGORY, OFFER, METRIC, FIGURES)
+    select 'Onboarding', '{off}', 'Total customers', {int(tot)} from dual
+    """)
+    con.commit()
+con.close()
+
+# Onboarding: last action tallies
+onboarding_actions = pd.merge(seg_onboarding, last_actions, on="CUSTOMER_ID")
+
+def write_onboarding_action_counts(df, offer_code):
+    counts = (
+        df[df["OFFER"] == offer_code]
+        .groupby("LAST_ACTION")
+        .size()
+        .sort_values(ascending=False)
+    )
+    con_loc = db_conn.connect_to_warehouse()
+    for act, cnt in counts.items():
+        con_loc.execute(f"""
+        insert into METRIC_RESULTS(CATEGORY, OFFER, METRIC, FIGURES)
+        select 'Onboarding', '{offer_code}', '{act}', {int(cnt)} from dual
+        """)
+        con_loc.commit()
+    con_loc.close()
+
+for code in ["OFFER_A", "OFFER_B", "OFFER_C", "OTHER"]:
+    write_onboarding_action_counts(onboarding_actions, code)
+
+# Onboarding: CSR calls (90d), spend-active (90d), BT-only
+onboard_calls = pd.merge(seg_onboarding, csr_calls, on="CUST_REF")
+offers, totals = np.unique(onboard_calls["OFFER"], return_counts=True)
+con = db_conn.connect_to_warehouse()
+for off, tot in zip(offers, totals):
+    con.execute(f"""
+    insert into METRIC_RESULTS(CATEGORY, OFFER, METRIC, FIGURES)
+    select 'Onboarding', '{off}', 'Customers calling contact centre (90d)', {int(tot)} from dual
+    """)
+    con.commit()
+con.close()
+
+onboard_spend = pd.merge(seg_onboarding, spend_active, on="CUSTOMER_ID")
+offers, totals = np.unique(onboard_spend["OFFER"], return_counts=True)
+con = db_conn.connect_to_warehouse()
+for off, tot in zip(offers, totals):
+    con.execute(f"""
+    insert into METRIC_RESULTS(CATEGORY, OFFER, METRIC, FIGURES)
+    select 'Onboarding', '{off}', 'Spend-active customers (90d)', {int(tot)} from dual
+    """)
+    con.commit()
+con.close()
+
+onboard_bt = pd.merge(seg_onboarding, bt_only, on="CUSTOMER_ID")
+offers, totals = np.unique(onboard_bt["OFFER"], return_counts=True)
+con = db_conn.connect_to_warehouse()
+for off, tot in zip(offers, totals):
+    con.execute(f"""
+    insert into METRIC_RESULTS(CATEGORY, OFFER, METRIC, FIGURES)
+    select 'Onboarding', '{off}', 'Only BT balance on last statement', {int(tot)} from dual
+    """)
+    con.commit()
+con.close()
+
+# Onboarding: dormancy buckets
+onboard_dorm = pd.merge(seg_onboarding, dormancy, on="CUSTOMER_ID")
+bucket_counts = onboard_dorm.groupby(["OFFER", "DORMANCY_BUCKET"]).size()
+con = db_conn.connect_to_warehouse()
+for (off, bucket), cnt in bucket_counts.items():
+    con.execute(f"""
+    insert into METRIC_RESULTS(CATEGORY, OFFER, METRIC, FIGURES)
+    select 'Onboarding', '{off}', 'Dormancy: {bucket}', {int(cnt)} from dual
+    """)
+    con.commit()
+con.close()
+
+# =========================================================
+# Export results
+# =========================================================
+con = db_conn.connect_to_warehouse()
+results_df = pd.read_sql("select * from METRIC_RESULTS", con)
+con.close()
+
+os.makedirs(".\\output", exist_ok=True)
+results_df.to_csv(".\\output\\digital_dormancy_results.csv", index=False)
+
+# =========================================================
+# Cleanup (best-effort)
+# =========================================================
+con = db_conn.connect_to_warehouse()
+for stmt in [
+    "drop table CUST_OPEN_CARD purge",
+    "drop table LAST_WEB_LOGIN purge",
+    "drop table LAST_APP_LOGIN purge",
+    "drop table LAST_DIGITAL_LOGIN purge",
+    "drop table LAST_APP_ACTION purge",
+    "drop table LAST_WEB_DATE_TIME purge",
+    "drop table LAST_WEB_ACTION purge",
+    "drop table SPEND_ACTIVE_90D purge",
+    "drop table CARD_BT_ONLY_INT purge",
+    "drop table CARD_BT_ONLY purge",
+    "drop table LAST_DIGITAL_PERIOD purge"
+]:
+    try:
+        con.execute(stmt)
+    except:
+        pass
+con.close()
+
+print("Digital_Dormancy_Analysis complete")
+```
